@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=77.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sigenergy-cloud"
+version = "0.1.0"
+description = "Async Python client for the Sigenergy Cloud app API"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "sigenergy-cloud contributors" },
+]
+maintainers = [
+    { name = "Daniel Schlaug", email = "daniel@schlaug.com" },
+]
+requires-python = ">=3.10"
+keywords = ["sigenergy", "home-assistant", "asyncio", "energy", "solar", "evse"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Home Automation",
+    "Typing :: Typed",
+]
+dependencies = [
+    "aiohttp>=3.9.0",
+    "pycryptodome>=3.19.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "aioresponses>=0.7",
+    "python-dotenv>=1.0",
+    "build>=1.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/solidfox/sigenergy-cloud"
+Issues = "https://github.com/solidfox/sigenergy-cloud/issues"
+Source = "https://github.com/solidfox/sigenergy-cloud"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+sigenergy_cloud = ["py.typed"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "live: requires real SIGENERGY_USERNAME / SIGENERGY_PASSWORD env vars (deselect with -m 'not live')",
+    "write: test writes to the device — always paired with the restore fixture",
+]
