@@ -91,6 +91,13 @@ class SigenergyCloudClient:
                 params={"id": self._station_id()},
             )
 
+    async def prediction_data(self) -> dict[str, Any]:
+        """Return Sigenergy AI forecast and plan series for the station."""
+        return await self._station_data(
+            "GET",
+            "prediction/predictData/get/predictData/{station_id}",
+        )
+
     async def available_operational_modes(self) -> dict[str, Any]:
         """Return available energy-profile modes."""
         data = await self._station_data("GET", "device/energy-profile/mode/all/{station_id}")
