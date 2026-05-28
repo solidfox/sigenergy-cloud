@@ -4,7 +4,13 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from sigenergy_cloud import BatteryLevelSettings, PeakShavingSchedule, PeakShavingSlot
+from sigenergy_cloud import (
+    BatteryLevelSettings,
+    InstantManualControl,
+    InstantManualMode,
+    PeakShavingSchedule,
+    PeakShavingSlot,
+)
 
 
 def test_battery_level_settings_round_trip() -> None:
@@ -30,6 +36,26 @@ def test_battery_level_settings_round_trip() -> None:
         "peakShavingSOC": "11",
         "backupSOC": "4",
     }
+
+
+def test_instant_manual_control_from_api() -> None:
+    control = InstantManualControl.from_api(
+        {"enable": True, "mode": "1", "endTime": "1776471497"}
+    )
+
+    assert control == InstantManualControl(
+        enabled=True,
+        mode=InstantManualMode.DISCHARGING,
+        end_time=1776471497,
+    )
+
+
+def test_disabled_instant_manual_control_from_api() -> None:
+    control = InstantManualControl.from_api(
+        {"enable": False, "mode": "", "endTime": ""}
+    )
+
+    assert control == InstantManualControl(enabled=False, mode=None, end_time=None)
 
 
 def test_peak_shaving_schedule_is_immutable_and_replaceable() -> None:

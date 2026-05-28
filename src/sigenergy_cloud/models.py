@@ -3,11 +3,42 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from enum import Enum
 from typing import Any
 
 
 def _int_percent(value: Any) -> int:
     return int(float(value))
+
+
+class InstantManualMode(str, Enum):
+    """Instant Manual Control action values as labelled by the Sigenergy app."""
+
+    CHARGING = "0"
+    DISCHARGING = "1"
+    HOLD_BATTERY = "2"
+    SELF_CONSUMPTION = "3"
+
+
+@dataclass(frozen=True, slots=True)
+class InstantManualControl:
+    """Current Instant Manual Control state."""
+
+    enabled: bool
+    mode: InstantManualMode | None
+    end_time: int | None
+
+    @classmethod
+    def from_api(cls, data: dict[str, Any]) -> "InstantManualControl":
+        raw_mode = data.get("mode")
+        mode = InstantManualMode(str(raw_mode)) if raw_mode not in (None, "") else None
+        raw_end_time = data.get("endTime")
+        end_time = int(raw_end_time) if raw_end_time not in (None, "") else None
+        return cls(
+            enabled=bool(data.get("enable")),
+            mode=mode,
+            end_time=end_time,
+        )
 
 
 @dataclass(frozen=True, slots=True)

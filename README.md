@@ -24,6 +24,10 @@ flow = await client.energy_flow()
 mode = await client.current_operational_mode()
 chargers = client.dc_sns
 
+# Temporarily override the active strategy without leaving Sigen AI mode.
+await client.set_instant_manual_control("0", duration_minutes=120)  # Charging
+await client.disable_instant_manual_control()
+
 await client.close()
 ```
 
@@ -35,6 +39,21 @@ await client.close()
 - Simple settings use small typed value objects.
 - Vendor response payloads are returned as dictionaries where the API shape is
   still being mapped.
+
+## Instant Manual Control
+
+The Sigenergy app exposes Instant Manual Control through the misspelled private
+path `device/energy-profile/instant/manunal`. The app labels the modes as:
+
+| Mode | Label |
+| --- | --- |
+| `0` | Charging |
+| `1` | Discharging |
+| `2` | Hold Battery |
+| `3` | Self-Consumption |
+
+Use `set_instant_manual_control()` for a 30-120 minute temporary override, and
+`disable_instant_manual_control()` to hand control back to the active strategy.
 
 ## Regions
 

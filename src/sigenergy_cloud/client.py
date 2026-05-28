@@ -9,9 +9,21 @@ import aiohttp
 
 from .auth import OAuthSession, encrypt_password
 from .errors import SigenergyCloudAPIError, SigenergyCloudRateLimitError
-from .models import BatteryLevelSettings, PeakShavingSchedule, PeakShavingSlot
+from .models import (
+    BatteryLevelSettings,
+    InstantManualControl,
+    InstantManualMode,
+    PeakShavingSchedule,
+    PeakShavingSlot,
+)
 from .regions import base_url_for_region
 from .transport import CloudTransport
+
+_INSTANT_MANUAL_UNLIMITED_POWER_KW = 4_294_967.295
+_INSTANT_MANUAL_POWER_MODES = {
+    InstantManualMode.CHARGING,
+    InstantManualMode.DISCHARGING,
+}
 
 
 class SigenergyCloudClient:
@@ -214,6 +226,71 @@ class SigenergyCloudClient:
         """Update one peak-shaving slot via read-modify-write."""
         schedule = (await self.peak_shaving_schedule()).with_slot(slot)
         return await self.set_peak_shaving_schedule(schedule)
+
+    async def instant_manual_control(self) -> InstantManualControl:
+        """Return current Instant Manual Control state."""
+        data = await self._station_data(
+            "GET", "device/energy-profile/instant/manunal/{station_id}"
+        )
+        return InstantManualControl.from_api(data)
+
+    async def instant_manual_display(self) -> dict[str, Any]:
+        """Return Instant Manual Control display values such as battery power and SOC."""
+        return await self._station_data(
+            "GET", "device/energy-profile/instant/manunal/display/{station_id}"
+        )
+
+    async def set_instant_manual_control(
+        self,
+        mode: InstantManualMode | str,
+        *,
+        duration_minutes: int,
+        power_limitation_kw: float | None = None,
+    ) -> dict[str, Any]:
+        """Enable Instant Manual Control for a bounded duration.
+
+        Sigenergy's app labels the modes as Charging, Discharging, Hold Battery,
+        and Self-Consumption. For Charging and Discharging, a missing power
+        limit follows the app's captured behavior and sends Sigenergy's
+        unlimited-power sentinel.
+        """
+        mode = InstantManualMode(mode)
+        if duration_minutes < 30 or duration_minutes > 120:
+            raise ValueError("Instant Manual Control duration must be 30-120 minutes")
+        if power_limitation_kw is None:
+            power_limitation = (
+                f"{_INSTANT_MANUAL_UNLIMITED_POWER_KW:.3f}"
+                if mode in _INSTANT_MANUAL_POWER_MODES
+                else ""
+            )
+        else:
+            power_limitation = f"{power_limitation_kw:.3f}"
+
+        return await self._envelope(
+            "PUT",
+            "device/energy-profile/instant/manunal",
+            json={
+                "enable": True,
+                "stationId": self._station_id_int(),
+                "mode": mode.value,
+                "duration": str(duration_minutes),
+                "powerLimitation": power_limitation,
+            },
+        )
+
+    async def disable_instant_manual_control(self) -> dict[str, Any]:
+        """Disable Instant Manual Control and return control to the active strategy."""
+        return await self._envelope(
+            "PUT",
+            "device/energy-profile/instant/manunal",
+            json={
+                "enable": False,
+                "stationId": self._station_id_int(),
+                "mode": "",
+                "duration": "",
+                "powerLimitation": "",
+            },
+        )
 
     async def dc_charge_mode_soc_range(self) -> dict[str, Any]:
         """Return allowed SOC ranges for DC charger mode settings."""

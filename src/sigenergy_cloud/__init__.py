@@ -8,10 +8,18 @@ from .errors import (
     SigenergyCloudRateLimitError,
     SigenergyCloudTokenExpiredError,
 )
-from .models import BatteryLevelSettings, PeakShavingSchedule, PeakShavingSlot
+from .models import (
+    BatteryLevelSettings,
+    InstantManualControl,
+    InstantManualMode,
+    PeakShavingSchedule,
+    PeakShavingSlot,
+)
 
 __all__ = [
     "BatteryLevelSettings",
+    "InstantManualControl",
+    "InstantManualMode",
     "PeakShavingSchedule",
     "PeakShavingSlot",
     "SigenergyCloudAPIError",
