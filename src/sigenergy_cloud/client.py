@@ -24,7 +24,11 @@ _INSTANT_MANUAL_POWER_MODES = {
     InstantManualMode.CHARGING,
     InstantManualMode.DISCHARGING,
 }
-
+# Central default headers for all requests made by this module.
+# Keep header key casing conventional (e.g. "User-Agent").
+_DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+}
 
 class SigenergyCloudClient:
     """Focused async client for the Sigenergy Cloud app API.
@@ -557,7 +561,7 @@ class SigenergyCloudClient:
         if self._session is not None:
             return self._session
         if self._owned_session is None or self._owned_session.closed:
-            self._owned_session = aiohttp.ClientSession()
+            self._owned_session = aiohttp.ClientSession(headers=dict(_DEFAULT_HEADERS))
         return self._owned_session
 
     def _station_id(self) -> str:
