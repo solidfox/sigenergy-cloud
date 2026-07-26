@@ -744,6 +744,27 @@ class SigenergyCloudClient:
             (not power_on) and status in {3, 5, 6}
         )
 
+    async def _force_aio_power_on(
+        self,
+        *,
+        sn_code: str,
+        timeout_s: float = 180.0,
+        poll_s: float = 2.0,
+    ) -> bool:
+        """Best-effort power-on. Used after AIO off so the plant is not left off."""
+        await self._envelope(
+            "POST",
+            "device/aio/on-off",
+            json={
+                "snCode": sn_code,
+                "stationId": self._station_id_int(),
+                "powerOn": True,
+            },
+        )
+        return await self.set_aio_power(
+            True, sn_code=sn_code, timeout_s=timeout_s, poll_s=poll_s
+        )
+
     async def restart_aio(
         self,
         *,
@@ -764,6 +785,10 @@ class SigenergyCloudClient:
         ``deviceStatus`` / ``communicateStatus``) → powerOn=true → poll until
         plant running. EVDC offline wait is best-effort with timeout so the
         plant is never left powered off.
+
+        After the off command is issued, a ``finally`` always attempts
+        power-on so cancellation / unexpected errors cannot leave the plant
+        off. Topology rate limits abort the EVDC wait early (still power on).
         """
         import asyncio
         import time
@@ -782,67 +807,63 @@ class SigenergyCloudClient:
         except Exception:  # noqa: BLE001
             evdc_before = {"offline": None, "error": "topology_read_failed"}
 
-        t_off_cmd = time.monotonic()
-        await self.toggle_aio_power(sn_code=sn)
-
         powered_off = False
+        powered_on = False
         t_offline = None
-        deadline = asyncio.get_running_loop().time() + timeout_s
-        while asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(poll_s)
-            home = await self.get_station_home_status()
-            if home.get("status") in {3, 5, 6}:
-                powered_off = True
-                t_offline = time.monotonic()
-                break
-
         t_evdc_offline = None
+        t_on_cmd: float | None = None
+        t_online = None
         evdc_after_off: dict[str, Any] | None = None
         evdc_offline_seen = False
-        if powered_off and wait_evdc_offline:
-            evdc_deadline = asyncio.get_running_loop().time() + max(
-                float(evdc_offline_wait_s), 0.0
-            )
-            while asyncio.get_running_loop().time() < evdc_deadline:
+        evdc_wait_aborted: str | None = None
+        power_on_forced = False
+        after_home: dict[str, Any] | None = None
+        after_power: bool | None = None
+        evdc_final: dict[str, Any] | None = None
+        off_issued = False
+
+        t_off_cmd = time.monotonic()
+        await self.toggle_aio_power(sn_code=sn)
+        off_issued = True
+
+        try:
+            deadline = asyncio.get_running_loop().time() + timeout_s
+            while asyncio.get_running_loop().time() < deadline:
                 await asyncio.sleep(poll_s)
-                try:
-                    evdc_after_off = await self.topology_evdc_status()
-                except Exception as exc:  # noqa: BLE001
-                    evdc_after_off = {"offline": None, "error": str(exc)}
-                if evdc_after_off.get("offline") is True:
-                    evdc_offline_seen = True
-                    t_evdc_offline = time.monotonic()
+                home = await self.get_station_home_status()
+                if home.get("status") in {3, 5, 6}:
+                    powered_off = True
+                    t_offline = time.monotonic()
                     break
 
-        if off_dwell_s > 0 and powered_off:
-            await asyncio.sleep(off_dwell_s)
+            if powered_off and wait_evdc_offline:
+                evdc_deadline = asyncio.get_running_loop().time() + max(
+                    float(evdc_offline_wait_s), 0.0
+                )
+                while asyncio.get_running_loop().time() < evdc_deadline:
+                    await asyncio.sleep(poll_s)
+                    try:
+                        evdc_after_off = await self.topology_evdc_status()
+                    except SigenergyCloudRateLimitError as exc:
+                        # Best-effort wait: do not hammer topology while plant is off.
+                        evdc_after_off = {
+                            "offline": None,
+                            "error": "rate_limited",
+                            "detail": str(exc),
+                        }
+                        evdc_wait_aborted = "topology_rate_limited"
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        evdc_after_off = {"offline": None, "error": str(exc)}
+                    if evdc_after_off.get("offline") is True:
+                        evdc_offline_seen = True
+                        t_evdc_offline = time.monotonic()
+                        break
 
-        t_on_cmd = time.monotonic()
-        await self._envelope(
-            "POST",
-            "device/aio/on-off",
-            json={
-                "snCode": sn,
-                "stationId": self._station_id_int(),
-                "powerOn": True,
-            },
-        )
+            if off_dwell_s > 0 and powered_off:
+                await asyncio.sleep(off_dwell_s)
 
-        powered_on = False
-        t_online = None
-        deadline = asyncio.get_running_loop().time() + timeout_s
-        while asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(poll_s)
-            home = await self.get_station_home_status()
-            power_on = await self.get_aio_power_on(sn_code=sn)
-            if home.get("status") in {0, 1, 2} and power_on is True:
-                powered_on = True
-                t_online = time.monotonic()
-                break
-
-        # Safety: if still power-off, try once more with powerOn true.
-        after_home = await self.get_station_home_status()
-        if after_home.get("status") in {3, 5, 6}:
+            t_on_cmd = time.monotonic()
             await self._envelope(
                 "POST",
                 "device/aio/on-off",
@@ -852,18 +873,69 @@ class SigenergyCloudClient:
                     "powerOn": True,
                 },
             )
-            powered_on = await self.set_aio_power(
-                True, sn_code=sn, timeout_s=timeout_s, poll_s=poll_s
-            )
-            after_home = await self.get_station_home_status()
-            if powered_on:
-                t_online = time.monotonic()
 
-        after_power = await self.get_aio_power_on(sn_code=sn)
-        try:
-            evdc_final = await self.topology_evdc_status()
-        except Exception:  # noqa: BLE001
-            evdc_final = {"offline": None, "error": "topology_read_failed"}
+            deadline = asyncio.get_running_loop().time() + timeout_s
+            while asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(poll_s)
+                home = await self.get_station_home_status()
+                power_on = await self.get_aio_power_on(sn_code=sn)
+                if home.get("status") in {0, 1, 2} and power_on is True:
+                    powered_on = True
+                    t_online = time.monotonic()
+                    break
+
+            # Safety: if still power-off, try once more with powerOn true.
+            after_home = await self.get_station_home_status()
+            if after_home.get("status") in {3, 5, 6}:
+                power_on_forced = True
+                powered_on = await self._force_aio_power_on(
+                    sn_code=sn, timeout_s=timeout_s, poll_s=poll_s
+                )
+                after_home = await self.get_station_home_status()
+                if powered_on:
+                    t_online = time.monotonic()
+        finally:
+            # Invariant: once off was issued, never leave the plant powered off
+            # (cancellation, rate-limit path, or unexpected errors).
+            if off_issued:
+                try:
+                    status_home = await self.get_station_home_status()
+                    power_flag = await self.get_aio_power_on(sn_code=sn)
+                    still_off = status_home.get("status") in {3, 5, 6} or power_flag is False
+                    if still_off:
+                        power_on_forced = True
+                        if t_on_cmd is None:
+                            t_on_cmd = time.monotonic()
+                        powered_on = await self._force_aio_power_on(
+                            sn_code=sn, timeout_s=timeout_s, poll_s=poll_s
+                        )
+                        if powered_on and t_online is None:
+                            t_online = time.monotonic()
+                    after_home = await self.get_station_home_status()
+                    after_power = await self.get_aio_power_on(sn_code=sn)
+                    if after_home.get("status") in {0, 1, 2} and after_power is True:
+                        powered_on = True
+                except Exception as exc:  # noqa: BLE001
+                    if after_home is None:
+                        after_home = {"status": None, "error": f"finally_status: {exc}"}
+                try:
+                    evdc_final = await self.topology_evdc_status()
+                except Exception:  # noqa: BLE001
+                    evdc_final = {"offline": None, "error": "topology_read_failed"}
+
+        if after_home is None:
+            after_home = {}
+        if after_power is None:
+            try:
+                after_power = await self.get_aio_power_on(sn_code=sn)
+            except Exception:  # noqa: BLE001
+                after_power = None
+        if evdc_final is None:
+            try:
+                evdc_final = await self.topology_evdc_status()
+            except Exception:  # noqa: BLE001
+                evdc_final = {"offline": None, "error": "topology_read_failed"}
+
         return {
             "sn_code": sn,
             "power_on_before": before_power,
@@ -873,6 +945,8 @@ class SigenergyCloudClient:
             "evdc_topology_after_off": evdc_after_off,
             "evdc_topology_after": evdc_final,
             "evdc_offline_seen": evdc_offline_seen,
+            "evdc_wait_aborted": evdc_wait_aborted,
+            "power_on_forced": power_on_forced,
             "powered_off": powered_off,
             "powered_on": powered_on,
             "power_on_after": after_power,
@@ -889,7 +963,9 @@ class SigenergyCloudClient:
                 else round(t_evdc_offline - t_offline, 2)
             ),
             "t_online_after_on_s": (
-                None if t_online is None else round(t_online - t_on_cmd, 2)
+                None
+                if t_online is None or t_on_cmd is None
+                else round(t_online - t_on_cmd, 2)
             ),
             "full_cycle_s": (
                 None if t_online is None else round(t_online - t_off_cmd, 2)
