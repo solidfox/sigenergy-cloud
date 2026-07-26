@@ -503,6 +503,273 @@ class SigenergyCloudClient:
             params={"current": page, "size": page_size},
         )
 
+    async def aio_serials(self) -> list[str]:
+        """Return all-in-one (SigenStor stack) serial numbers for the station."""
+        data = await self._station_data(
+            "GET",
+            "device/aio/by/station",
+            station_query=True,
+        )
+        if isinstance(data, list):
+            return [str(sn) for sn in data if sn]
+        if isinstance(data, dict):
+            for key in ("snList", "aioSnList", "list", "data"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    return [str(sn) for sn in value if sn]
+        return []
+
+    async def get_aio_power_on(self, *, sn_code: str | None = None) -> bool:
+        """Return True when the AIO reports powered-on via mySigen power status."""
+        sn = sn_code or (await self._default_aio_sn())
+        data = await self._data(
+            "GET",
+            "device/sigenMate/getPowerOnOffStatus",
+            params={"stationId": self._station_id(), "deviceSnCode": sn},
+        )
+        if isinstance(data, bool):
+            return data
+        if isinstance(data, (int, float)):
+            return data != 0
+        if isinstance(data, dict):
+            for key in ("powerOn", "isPowerOn", "status"):
+                if key in data and data[key] is not None:
+                    value = data[key]
+                    if isinstance(value, bool):
+                        return value
+                    if isinstance(value, (int, float)):
+                        return value != 0
+                    return bool(value)
+        return bool(data)
+
+    async def get_aio_on_off_state(self, *, sn_code: str | None = None) -> bool:
+        """Return raw /device/aio/on-off-state boolean for an AIO serial."""
+        sn = sn_code or (await self._default_aio_sn())
+        data = await self._data(
+            "GET",
+            "device/aio/on-off-state",
+            params={"stationId": self._station_id(), "snCode": sn},
+        )
+        return bool(data)
+
+    async def toggle_aio_power(self, *, sn_code: str | None = None) -> Any:
+        """Toggle AIO power via POST /device/aio/on-off (mySigen device power control)."""
+        sn = sn_code or (await self._default_aio_sn())
+        return await self._envelope(
+            "POST",
+            "device/aio/on-off",
+            json={"snCode": sn, "stationId": self._station_id_int()},
+        )
+
+    async def get_station_home_status(self) -> dict[str, Any]:
+        """Return station home payload fields used as power-cycle truth."""
+        home = await self.refresh_station()
+        return {
+            "status": home.get("status"),
+            "statusDesc": home.get("statusDesc"),
+            "onGrid": home.get("onGrid"),
+            "shutdownReason": home.get("shutdownReason"),
+        }
+
+    async def set_aio_power(
+        self,
+        power_on: bool,
+        *,
+        sn_code: str | None = None,
+        timeout_s: float = 120.0,
+        poll_s: float = 2.0,
+    ) -> bool:
+        """Drive AIO power using home status as truth (0/1/2 running, 3/5/6 power-off)."""
+        import asyncio
+
+        sn = sn_code or (await self._default_aio_sn())
+        home = await self.get_station_home_status()
+        status = home.get("status")
+        running = status in {0, 1, 2}
+        powered_off = status in {3, 5, 6}
+        if power_on and running:
+            return True
+        if (not power_on) and powered_off:
+            return True
+
+        if power_on:
+            await self._envelope(
+                "POST",
+                "device/aio/on-off",
+                json={
+                    "snCode": sn,
+                    "stationId": self._station_id_int(),
+                    "powerOn": True,
+                },
+            )
+        else:
+            # Plain body acts as a toggle from running -> off in app traces.
+            await self.toggle_aio_power(sn_code=sn)
+
+        deadline = asyncio.get_running_loop().time() + timeout_s
+        while asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(poll_s)
+            status = (await self.get_station_home_status()).get("status")
+            if power_on and status in {0, 1, 2}:
+                return True
+            if (not power_on) and status in {3, 5, 6}:
+                return True
+        status = (await self.get_station_home_status()).get("status")
+        return (power_on and status in {0, 1, 2}) or (
+            (not power_on) and status in {3, 5, 6}
+        )
+
+    async def restart_aio(
+        self,
+        *,
+        sn_code: str | None = None,
+        off_dwell_s: float = 0.0,
+        timeout_s: float = 180.0,
+        poll_s: float = 2.0,
+        wait_evdc_status_change: bool = True,
+        evdc_status_wait_s: float = 60.0,
+    ) -> dict[str, Any]:
+        """Minimal AIO power-cycle for SECC/estcom recovery.
+
+        Off, poll until home is Power-off, optionally wait until
+        ``device/dcevse/status`` changes from its pre-off value (EVDC stack
+        reaction), optional fixed dwell, then on with powerOn=true and poll
+        until home is running again. Home status is plant truth; EVDC status
+        wait is best-effort with a timeout so the plant is never left off.
+        """
+        import asyncio
+        import time
+
+        sn = sn_code or (await self._default_aio_sn())
+        t0 = time.monotonic()
+        before_home = await self.get_station_home_status()
+        before_power = await self.get_aio_power_on(sn_code=sn)
+        try:
+            dc_status_before = await self.dc_status()
+        except Exception:  # noqa: BLE001 - cycle must continue even if EVDC read fails
+            dc_status_before = None
+
+        t_off_cmd = time.monotonic()
+        await self.toggle_aio_power(sn_code=sn)
+
+        powered_off = False
+        t_offline = None
+        deadline = asyncio.get_running_loop().time() + timeout_s
+        while asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(poll_s)
+            home = await self.get_station_home_status()
+            if home.get("status") in {3, 5, 6}:
+                powered_off = True
+                t_offline = time.monotonic()
+                break
+
+        t_evdc_change = None
+        dc_status_after_off = None
+        evdc_status_changed = False
+        if powered_off and wait_evdc_status_change:
+            # Wait for GET device/dcevse/status to move away from pre-off value.
+            # Observed ~10s after plant Power-off when pre-off was non-idle.
+            evdc_deadline = asyncio.get_running_loop().time() + max(evdc_status_wait_s, 0.0)
+            while asyncio.get_running_loop().time() < evdc_deadline:
+                await asyncio.sleep(poll_s)
+                try:
+                    dc_status_after_off = await self.dc_status()
+                except Exception:  # noqa: BLE001
+                    dc_status_after_off = "error"
+                if dc_status_after_off != dc_status_before:
+                    evdc_status_changed = True
+                    t_evdc_change = time.monotonic()
+                    break
+
+        if off_dwell_s > 0 and powered_off:
+            await asyncio.sleep(off_dwell_s)
+
+        t_on_cmd = time.monotonic()
+        await self._envelope(
+            "POST",
+            "device/aio/on-off",
+            json={
+                "snCode": sn,
+                "stationId": self._station_id_int(),
+                "powerOn": True,
+            },
+        )
+
+        powered_on = False
+        t_online = None
+        deadline = asyncio.get_running_loop().time() + timeout_s
+        while asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(poll_s)
+            home = await self.get_station_home_status()
+            power_on = await self.get_aio_power_on(sn_code=sn)
+            if home.get("status") in {0, 1, 2} and power_on is True:
+                powered_on = True
+                t_online = time.monotonic()
+                break
+
+        # Safety: if still power-off, try once more with powerOn true.
+        after_home = await self.get_station_home_status()
+        if after_home.get("status") in {3, 5, 6}:
+            await self._envelope(
+                "POST",
+                "device/aio/on-off",
+                json={
+                    "snCode": sn,
+                    "stationId": self._station_id_int(),
+                    "powerOn": True,
+                },
+            )
+            powered_on = await self.set_aio_power(
+                True, sn_code=sn, timeout_s=timeout_s, poll_s=poll_s
+            )
+            after_home = await self.get_station_home_status()
+            if powered_on:
+                t_online = time.monotonic()
+
+        after_power = await self.get_aio_power_on(sn_code=sn)
+        try:
+            dc_status_final = await self.dc_status()
+        except Exception:  # noqa: BLE001
+            dc_status_final = None
+        return {
+            "sn_code": sn,
+            "power_on_before": before_power,
+            "home_status_before": before_home.get("status"),
+            "home_status_desc_before": before_home.get("statusDesc"),
+            "dc_status_before": dc_status_before,
+            "dc_status_after_off": dc_status_after_off,
+            "dc_status_after": dc_status_final,
+            "evdc_status_changed": evdc_status_changed,
+            "powered_off": powered_off,
+            "powered_on": powered_on,
+            "power_on_after": after_power,
+            "home_status_after": after_home.get("status"),
+            "home_status_desc_after": after_home.get("statusDesc"),
+            "off_dwell_s": off_dwell_s,
+            "poll_s": poll_s,
+            "wait_evdc_status_change": wait_evdc_status_change,
+            "evdc_status_wait_s": evdc_status_wait_s,
+            "t_offline_s": None if t_offline is None else round(t_offline - t_off_cmd, 2),
+            "t_evdc_change_after_offline_s": (
+                None
+                if t_evdc_change is None or t_offline is None
+                else round(t_evdc_change - t_offline, 2)
+            ),
+            "t_online_after_on_s": (
+                None if t_online is None else round(t_online - t_on_cmd, 2)
+            ),
+            "full_cycle_s": (
+                None if t_online is None else round(t_online - t_off_cmd, 2)
+            ),
+            "elapsed_s": round(time.monotonic() - t0, 2),
+        }
+
+    async def _default_aio_sn(self) -> str:
+        serials = await self.aio_serials()
+        if not serials:
+            raise RuntimeError("No AIO serial numbers found for this station")
+        return serials[0]
+
     async def _set_grid_limit(
         self, direction: str, limit_kw: float, enabled: bool
     ) -> dict[str, Any]:
