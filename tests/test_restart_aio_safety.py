@@ -143,3 +143,67 @@ async def test_restart_aio_finally_powers_on_after_cancel() -> None:
     await _cancel_during_wait()
     assert client.toggle_calls == 1
     assert any(p.get("powerOn") is True for p in client.power_on_posts)
+
+
+@pytest.mark.asyncio
+async def test_restart_aio_force_on_when_status_reads_fail() -> None:
+    """When status reads fail mid-cycle, finally still force-powers on."""
+    client = _RestartStub()
+    client.home_status_seq = [1, 3]  # before + first off poll only
+    client.power_on_seq = [True, False]
+    client.topology_seq = [
+        {"offline": False, "device_status": 1, "communicate_status": 2, "node_found": True},
+    ]
+
+    real_home = client.get_station_home_status
+    calls = {"n": 0}
+
+    async def flaky_home() -> dict[str, Any]:
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            return await real_home()
+        raise SigenergyCloudRateLimitError("429 on home")
+
+    client.get_station_home_status = flaky_home  # type: ignore[method-assign]
+
+    with pytest.raises(SigenergyCloudRateLimitError):
+        await client.restart_aio(
+            off_dwell_s=0.0,
+            poll_s=0.0,
+            timeout_s=5.0,
+            wait_evdc_offline=False,
+        )
+    # finally recovery must still have issued powerOn
+    assert any(p.get("powerOn") is True for p in client.power_on_posts)
+
+
+@pytest.mark.asyncio
+async def test_restart_aio_marks_off_attempted_before_toggle_cancel() -> None:
+    """Cancel during the off toggle still runs ensure-on recovery."""
+    client = _RestartStub()
+    client.home_status_seq = [1, 3, 1, 1]
+    client.power_on_seq = [True, False, True, True]
+    client.topology_seq = [
+        {"offline": False, "device_status": 1, "communicate_status": 2, "node_found": True},
+    ]
+
+    async def slow_toggle(*, sn_code: str | None = None) -> Any:
+        client.toggle_calls += 1
+        await asyncio.sleep(1.0)
+        return {"ok": True}
+
+    client.toggle_aio_power = slow_toggle  # type: ignore[method-assign]
+
+    task = asyncio.create_task(
+        client.restart_aio(
+            off_dwell_s=0.0,
+            poll_s=0.0,
+            timeout_s=5.0,
+            wait_evdc_offline=False,
+        )
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert any(p.get("powerOn") is True for p in client.power_on_posts)

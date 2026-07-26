@@ -786,9 +786,9 @@ class SigenergyCloudClient:
         plant running. EVDC offline wait is best-effort with timeout so the
         plant is never left powered off.
 
-        After the off command is issued, a ``finally`` always attempts
-        power-on so cancellation / unexpected errors cannot leave the plant
-        off. Topology rate limits abort the EVDC wait early (still power on).
+        After off is attempted, a shielded ``finally`` recovery always tries to
+        restore power-on (including on cancel and status-read failures). Topology
+        rate limits abort the EVDC wait early and still power on.
         """
         import asyncio
         import time
@@ -813,6 +813,7 @@ class SigenergyCloudClient:
         t_evdc_offline = None
         t_on_cmd: float | None = None
         t_online = None
+        t_off_cmd = time.monotonic()
         evdc_after_off: dict[str, Any] | None = None
         evdc_offline_seen = False
         evdc_wait_aborted: str | None = None
@@ -820,13 +821,58 @@ class SigenergyCloudClient:
         after_home: dict[str, Any] | None = None
         after_power: bool | None = None
         evdc_final: dict[str, Any] | None = None
-        off_issued = False
+        # Set before toggle await so cancel mid-off still runs recovery.
+        off_attempted = False
 
-        t_off_cmd = time.monotonic()
-        await self.toggle_aio_power(sn_code=sn)
-        off_issued = True
+        async def _ensure_powered_on(*, reason: str) -> None:
+            """Best-effort restore. Read failures still force power-on."""
+            nonlocal powered_on, power_on_forced, t_on_cmd, t_online
+            nonlocal after_home, after_power
+            clearly_on = False
+            try:
+                status_home = await self.get_station_home_status()
+                power_flag = await self.get_aio_power_on(sn_code=sn)
+                clearly_on = (
+                    status_home.get("status") in {0, 1, 2} and power_flag is True
+                )
+            except Exception:  # noqa: BLE001
+                clearly_on = False
+            if clearly_on:
+                powered_on = True
+                try:
+                    after_home = await self.get_station_home_status()
+                    after_power = await self.get_aio_power_on(sn_code=sn)
+                except Exception:  # noqa: BLE001
+                    after_power = True
+                return
+            power_on_forced = True
+            if t_on_cmd is None:
+                t_on_cmd = time.monotonic()
+            try:
+                powered_on = await self._force_aio_power_on(
+                    sn_code=sn, timeout_s=timeout_s, poll_s=poll_s
+                )
+            except Exception:  # noqa: BLE001
+                powered_on = False
+            if powered_on and t_online is None:
+                t_online = time.monotonic()
+            try:
+                after_home = await self.get_station_home_status()
+                after_power = await self.get_aio_power_on(sn_code=sn)
+                if after_home.get("status") in {0, 1, 2} and after_power is True:
+                    powered_on = True
+            except Exception as exc:  # noqa: BLE001
+                if after_home is None:
+                    after_home = {
+                        "status": None,
+                        "error": f"ensure_on_status ({reason}): {exc}",
+                    }
 
         try:
+            off_attempted = True
+            t_off_cmd = time.monotonic()
+            await self.toggle_aio_power(sn_code=sn)
+
             deadline = asyncio.get_running_loop().time() + timeout_s
             while asyncio.get_running_loop().time() < deadline:
                 await asyncio.sleep(poll_s)
@@ -887,37 +933,21 @@ class SigenergyCloudClient:
             # Safety: if still power-off, try once more with powerOn true.
             after_home = await self.get_station_home_status()
             if after_home.get("status") in {3, 5, 6}:
-                power_on_forced = True
-                powered_on = await self._force_aio_power_on(
-                    sn_code=sn, timeout_s=timeout_s, poll_s=poll_s
-                )
-                after_home = await self.get_station_home_status()
-                if powered_on:
-                    t_online = time.monotonic()
+                await _ensure_powered_on(reason="post_cycle_still_off")
         finally:
-            # Invariant: once off was issued, never leave the plant powered off
-            # (cancellation, rate-limit path, or unexpected errors).
-            if off_issued:
+            # Invariant: once off was attempted, never leave the plant powered off.
+            # Shield recovery so outer cancel/timeout cannot abort the force-on.
+            if off_attempted:
+                recovery = asyncio.create_task(
+                    _ensure_powered_on(reason="finally"),
+                    name="sigenergy-restart-aio-ensure-on",
+                )
                 try:
-                    status_home = await self.get_station_home_status()
-                    power_flag = await self.get_aio_power_on(sn_code=sn)
-                    still_off = status_home.get("status") in {3, 5, 6} or power_flag is False
-                    if still_off:
-                        power_on_forced = True
-                        if t_on_cmd is None:
-                            t_on_cmd = time.monotonic()
-                        powered_on = await self._force_aio_power_on(
-                            sn_code=sn, timeout_s=timeout_s, poll_s=poll_s
-                        )
-                        if powered_on and t_online is None:
-                            t_online = time.monotonic()
-                    after_home = await self.get_station_home_status()
-                    after_power = await self.get_aio_power_on(sn_code=sn)
-                    if after_home.get("status") in {0, 1, 2} and after_power is True:
-                        powered_on = True
-                except Exception as exc:  # noqa: BLE001
-                    if after_home is None:
-                        after_home = {"status": None, "error": f"finally_status: {exc}"}
+                    await asyncio.shield(recovery)
+                except asyncio.CancelledError:
+                    # Finish force-on even if this coroutine is cancelled.
+                    await recovery
+                    raise
                 try:
                     evdc_final = await self.topology_evdc_status()
                 except Exception:  # noqa: BLE001
