@@ -828,6 +828,8 @@ class SigenergyCloudClient:
             """Best-effort restore. Read failures still force power-on."""
             nonlocal powered_on, power_on_forced, t_on_cmd, t_online
             nonlocal after_home, after_power
+            status_home: dict[str, Any] | None = None
+            power_flag: bool | None = None
             clearly_on = False
             try:
                 status_home = await self.get_station_home_status()
@@ -838,12 +840,11 @@ class SigenergyCloudClient:
             except Exception:  # noqa: BLE001
                 clearly_on = False
             if clearly_on:
+                # Reuse the same reads that proved online — do not re-query
+                # (a later transient failure would leave after_* inconsistent).
                 powered_on = True
-                try:
-                    after_home = await self.get_station_home_status()
-                    after_power = await self.get_aio_power_on(sn_code=sn)
-                except Exception:  # noqa: BLE001
-                    after_power = True
+                after_home = status_home
+                after_power = power_flag
                 return
             power_on_forced = True
             if t_on_cmd is None:
