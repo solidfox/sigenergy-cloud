@@ -519,6 +519,131 @@ class SigenergyCloudClient:
                     return [str(sn) for sn in value if sn]
         return []
 
+    # Topology deviceType values from device/devicetreepanel/topology (mySigen).
+    TOPO_DEVICE_TYPE_AIO = 2
+    TOPO_DEVICE_TYPE_INVERTER = 3
+    TOPO_DEVICE_TYPE_BATTERY = 4
+    TOPO_DEVICE_TYPE_DC_CHARGER = 5
+    TOPO_DEVICE_TYPE_GATEWAY = 8
+
+    # Flutter UI maps (HAR): communicateStatus 1=offline, 2=online;
+    # deviceStatus 4=offline, 5=powerOff, 44=offline. 0/3 observed during AIO off.
+    TOPO_DEVICE_STATUS_OFFLINE = frozenset({0, 3, 4, 5, 44})
+    TOPO_COMMUNICATE_STATUS_OFFLINE = 1
+    TOPO_COMMUNICATE_STATUS_ONLINE = 2
+
+    async def device_topology(self) -> dict[str, Any]:
+        """Return SigenStor device tree (AIO / inverter / EVDC / batteries).
+
+        Source for the mySigen SigenStor detail panel status rows.
+        """
+        data = await self._data(
+            "GET",
+            "device/devicetreepanel/topology",
+            params={"stationId": self._station_id()},
+        )
+        return data if isinstance(data, dict) else {"raw": data}
+
+    @classmethod
+    def iter_topology_nodes(cls, topology: dict[str, Any] | None) -> list[dict[str, Any]]:
+        """Flatten topology nodeList tree into a list of device dicts."""
+        if not isinstance(topology, dict):
+            return []
+        nodes: list[dict[str, Any]] = []
+
+        def _walk(items: Any) -> None:
+            if not isinstance(items, list):
+                return
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                nodes.append(item)
+                _walk(item.get("nodeList"))
+
+        _walk(topology.get("nodeList"))
+        return nodes
+
+    @classmethod
+    def topology_node_is_offline(cls, node: dict[str, Any] | None) -> bool | None:
+        """Return True when topology node is offline/power-off per app status maps."""
+        if not isinstance(node, dict):
+            return None
+        try:
+            communicate = (
+                int(node["communicateStatus"])
+                if node.get("communicateStatus") is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            communicate = None
+        try:
+            device_status = (
+                int(node["deviceStatus"]) if node.get("deviceStatus") is not None else None
+            )
+        except (TypeError, ValueError):
+            device_status = None
+        if communicate == cls.TOPO_COMMUNICATE_STATUS_OFFLINE:
+            return True
+        if device_status in cls.TOPO_DEVICE_STATUS_OFFLINE:
+            return True
+        if (
+            communicate == cls.TOPO_COMMUNICATE_STATUS_ONLINE
+            and device_status == 1
+        ):
+            return False
+        if device_status == 1 and communicate is None:
+            return False
+        if device_status is None and communicate is None:
+            return None
+        # Unknown non-online combination: treat as not definitively online.
+        return True if device_status not in (None, 1) else False
+
+    def topology_find_node(
+        self,
+        topology: dict[str, Any] | None,
+        *,
+        device_type: int | None = None,
+        sn_code: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Find first topology node matching device type and/or serial."""
+        sn_norm = str(sn_code).strip() if sn_code else None
+        for node in self.iter_topology_nodes(topology):
+            if device_type is not None and node.get("deviceType") != device_type:
+                continue
+            if sn_norm is not None:
+                node_sn = str(node.get("snCode") or node.get("showSnCode") or "").strip()
+                if node_sn != sn_norm:
+                    continue
+            return node
+        return None
+
+    async def topology_evdc_status(
+        self, *, dc_sn: str | None = None
+    ) -> dict[str, Any]:
+        """Return EVDC (DC Charger) topology status for offline detection."""
+        topology = await self.device_topology()
+        sn = self._dc_sn(dc_sn)
+        node = self.topology_find_node(
+            topology,
+            device_type=self.TOPO_DEVICE_TYPE_DC_CHARGER,
+            sn_code=sn,
+        )
+        if node is None:
+            node = self.topology_find_node(
+                topology, device_type=self.TOPO_DEVICE_TYPE_DC_CHARGER
+            )
+        offline = self.topology_node_is_offline(node)
+        return {
+            "station_status": topology.get("stationStatus"),
+            "sn_code": (node or {}).get("snCode") or (node or {}).get("showSnCode"),
+            "device_type": (node or {}).get("deviceType"),
+            "device_type_desc": (node or {}).get("deviceTypeDesc"),
+            "device_status": (node or {}).get("deviceStatus"),
+            "communicate_status": (node or {}).get("communicateStatus"),
+            "offline": offline,
+            "node_found": node is not None,
+        }
+
     async def get_aio_power_on(self, *, sn_code: str | None = None) -> bool:
         """Return True when the AIO reports powered-on via mySigen power status."""
         sn = sn_code or (await self._default_aio_sn())
@@ -626,28 +751,36 @@ class SigenergyCloudClient:
         off_dwell_s: float = 0.0,
         timeout_s: float = 180.0,
         poll_s: float = 2.0,
-        wait_evdc_status_change: bool = True,
-        evdc_status_wait_s: float = 60.0,
+        wait_evdc_offline: bool = True,
+        evdc_offline_wait_s: float = 120.0,
+        # Back-compat aliases from 0.1.5 experiments.
+        wait_evdc_status_change: bool | None = None,
+        evdc_status_wait_s: float | None = None,
     ) -> dict[str, Any]:
         """Minimal AIO power-cycle for SECC/estcom recovery.
 
-        Off, poll until home is Power-off, optionally wait until
-        ``device/dcevse/status`` changes from its pre-off value (EVDC stack
-        reaction), optional fixed dwell, then on with powerOn=true and poll
-        until home is running again. Home status is plant truth; EVDC status
-        wait is best-effort with a timeout so the plant is never left off.
+        Off → poll until plant Power-off → wait until topology reports EVDC
+        offline (``device/devicetreepanel/topology`` DC Charger node
+        ``deviceStatus`` / ``communicateStatus``) → powerOn=true → poll until
+        plant running. EVDC offline wait is best-effort with timeout so the
+        plant is never left powered off.
         """
         import asyncio
         import time
+
+        if wait_evdc_status_change is not None:
+            wait_evdc_offline = wait_evdc_status_change
+        if evdc_status_wait_s is not None:
+            evdc_offline_wait_s = evdc_status_wait_s
 
         sn = sn_code or (await self._default_aio_sn())
         t0 = time.monotonic()
         before_home = await self.get_station_home_status()
         before_power = await self.get_aio_power_on(sn_code=sn)
         try:
-            dc_status_before = await self.dc_status()
-        except Exception:  # noqa: BLE001 - cycle must continue even if EVDC read fails
-            dc_status_before = None
+            evdc_before = await self.topology_evdc_status()
+        except Exception:  # noqa: BLE001
+            evdc_before = {"offline": None, "error": "topology_read_failed"}
 
         t_off_cmd = time.monotonic()
         await self.toggle_aio_power(sn_code=sn)
@@ -663,22 +796,22 @@ class SigenergyCloudClient:
                 t_offline = time.monotonic()
                 break
 
-        t_evdc_change = None
-        dc_status_after_off = None
-        evdc_status_changed = False
-        if powered_off and wait_evdc_status_change:
-            # Wait for GET device/dcevse/status to move away from pre-off value.
-            # Observed ~10s after plant Power-off when pre-off was non-idle.
-            evdc_deadline = asyncio.get_running_loop().time() + max(evdc_status_wait_s, 0.0)
+        t_evdc_offline = None
+        evdc_after_off: dict[str, Any] | None = None
+        evdc_offline_seen = False
+        if powered_off and wait_evdc_offline:
+            evdc_deadline = asyncio.get_running_loop().time() + max(
+                float(evdc_offline_wait_s), 0.0
+            )
             while asyncio.get_running_loop().time() < evdc_deadline:
                 await asyncio.sleep(poll_s)
                 try:
-                    dc_status_after_off = await self.dc_status()
-                except Exception:  # noqa: BLE001
-                    dc_status_after_off = "error"
-                if dc_status_after_off != dc_status_before:
-                    evdc_status_changed = True
-                    t_evdc_change = time.monotonic()
+                    evdc_after_off = await self.topology_evdc_status()
+                except Exception as exc:  # noqa: BLE001
+                    evdc_after_off = {"offline": None, "error": str(exc)}
+                if evdc_after_off.get("offline") is True:
+                    evdc_offline_seen = True
+                    t_evdc_offline = time.monotonic()
                     break
 
         if off_dwell_s > 0 and powered_off:
@@ -728,18 +861,18 @@ class SigenergyCloudClient:
 
         after_power = await self.get_aio_power_on(sn_code=sn)
         try:
-            dc_status_final = await self.dc_status()
+            evdc_final = await self.topology_evdc_status()
         except Exception:  # noqa: BLE001
-            dc_status_final = None
+            evdc_final = {"offline": None, "error": "topology_read_failed"}
         return {
             "sn_code": sn,
             "power_on_before": before_power,
             "home_status_before": before_home.get("status"),
             "home_status_desc_before": before_home.get("statusDesc"),
-            "dc_status_before": dc_status_before,
-            "dc_status_after_off": dc_status_after_off,
-            "dc_status_after": dc_status_final,
-            "evdc_status_changed": evdc_status_changed,
+            "evdc_topology_before": evdc_before,
+            "evdc_topology_after_off": evdc_after_off,
+            "evdc_topology_after": evdc_final,
+            "evdc_offline_seen": evdc_offline_seen,
             "powered_off": powered_off,
             "powered_on": powered_on,
             "power_on_after": after_power,
@@ -747,13 +880,13 @@ class SigenergyCloudClient:
             "home_status_desc_after": after_home.get("statusDesc"),
             "off_dwell_s": off_dwell_s,
             "poll_s": poll_s,
-            "wait_evdc_status_change": wait_evdc_status_change,
-            "evdc_status_wait_s": evdc_status_wait_s,
+            "wait_evdc_offline": wait_evdc_offline,
+            "evdc_offline_wait_s": evdc_offline_wait_s,
             "t_offline_s": None if t_offline is None else round(t_offline - t_off_cmd, 2),
-            "t_evdc_change_after_offline_s": (
+            "t_evdc_offline_after_plant_off_s": (
                 None
-                if t_evdc_change is None or t_offline is None
-                else round(t_evdc_change - t_offline, 2)
+                if t_evdc_offline is None or t_offline is None
+                else round(t_evdc_offline - t_offline, 2)
             ),
             "t_online_after_on_s": (
                 None if t_online is None else round(t_online - t_on_cmd, 2)
