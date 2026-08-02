@@ -190,3 +190,86 @@ async def test_disable_instant_manual_control() -> None:
         }
     finally:
         await session.close()
+
+
+@pytest.mark.asyncio
+async def test_electricity_tax_and_fee_endpoints() -> None:
+    session = aiohttp.ClientSession()
+    client = SigenergyCloudClient("user", "password", session=session)
+    try:
+        with aioresponses() as mocked:
+            mocked.post(
+                "https://api-eu.sigencloud.com/auth/oauth/token",
+                payload={
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "expires_in": 3600,
+                },
+            )
+            mocked.get(
+                "https://api-eu.sigencloud.com/device/owner/station/home",
+                payload={
+                    "code": 0,
+                    "data": {
+                        "stationId": "12025061000219",
+                        "acSnList": [],
+                        "dcSnList": [],
+                    },
+                },
+            )
+            mocked.get(
+                "https://api-eu.sigencloud.com/electricity-price/api/tax-and-fee/12025061000219",
+                payload={
+                    "code": 0,
+                    "data": {
+                        "buyTaxAndFee": {"taxSettings": {"fixedTaxRate": 25.0}, "additionalFeeList": []},
+                        "sellTaxAndFee": {"taxSettings": {"fixedTaxRate": 0.0}, "additionalFeeList": []},
+                    },
+                },
+            )
+            mocked.post(
+                "https://api-eu.sigencloud.com/electricity-price/api/tax-and-fee",
+                payload={"code": 0, "msg": "success", "data": True},
+            )
+            mocked.get(
+                "https://api-eu.sigencloud.com/prediction/aipv/elecPrice/get/priceCost?stationId=12025061000219",
+                payload={
+                    "code": 0,
+                    "data": {
+                        "buyElecCost": 0.0,
+                        "sellElecCost": 4.12,
+                        "buyPriceCoefficient": 1.25,
+                        "sellPriceCoefficient": 1.0,
+                    },
+                },
+            )
+
+            await client.connect()
+            tax_fee = await client.electricity_tax_and_fee()
+            assert tax_fee["buyTaxAndFee"]["taxSettings"]["fixedTaxRate"] == 25.0
+
+            buy_payload = {
+                "taxSettings": {
+                    "enableNegativePriceTax": False,
+                    "negativePriceTaxRate": 0.0,
+                    "taxMode": 0,
+                    "fixedTaxRate": 25.0,
+                    "touSchedule": [],
+                },
+                "additionalFeeList": [
+                    {
+                        "feeName": "Energy tax",
+                        "feeType": 0,
+                        "applyTax": True,
+                        "fixedValue": 36.0,
+                        "touSchedule": [],
+                    }
+                ],
+            }
+            saved = await client.set_electricity_tax_and_fee(1, buy_payload)
+            assert saved["data"] is True
+
+            cost = await client.electricity_price_cost()
+            assert cost["buyPriceCoefficient"] == 1.25
+    finally:
+        await session.close()

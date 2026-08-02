@@ -110,6 +110,48 @@ class SigenergyCloudClient:
             "prediction/predictData/get/predictData/{station_id}",
         )
 
+    async def electricity_tax_and_fee(self) -> dict[str, Any]:
+        """Return buy/sell tax-and-fee settings used with dynamic Nord Pool tariffs.
+
+        Values such as ``fixedValue`` and TOU ``value`` fields are in the
+        station's minor currency unit (öre for SEK; see country-currency
+        ``conversionRatio``).
+        """
+        return await self._data(
+            "GET",
+            f"electricity-price/api/tax-and-fee/{self._station_id()}",
+        )
+
+    async def set_electricity_tax_and_fee(
+        self,
+        direction: int,
+        tax_and_fee: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Replace buy (direction=1) or sell (direction=2) tax-and-fee settings.
+
+        This is the supported write path for Nord Pool AI price modeling. Fee
+        amounts are in the minor currency unit (öre for SEK).
+        """
+        if direction not in (1, 2):
+            raise ValueError("direction must be 1 (buy) or 2 (sell)")
+        return await self._envelope(
+            "POST",
+            "electricity-price/api/tax-and-fee",
+            json={
+                "stationId": self._station_id_int(),
+                "directionType": direction,
+                "taxAndFee": tax_and_fee,
+            },
+        )
+
+    async def electricity_price_cost(self) -> dict[str, Any]:
+        """Return derived price coefficients and tax/fee summary for the station."""
+        return await self._data(
+            "GET",
+            "prediction/aipv/elecPrice/get/priceCost",
+            params={"stationId": self._station_id()},
+        )
+
     async def available_operational_modes(self) -> dict[str, Any]:
         """Return available energy-profile modes."""
         data = await self._station_data("GET", "device/energy-profile/mode/all/{station_id}")
