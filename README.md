@@ -59,6 +59,7 @@ Use `set_instant_manual_control()` for a 30-120 minute temporary override, and
 
 | Region | Base URL |
 | --- | --- |
+| `aus` | `https://api-aus.sigencloud.com/` |
 | `eu` | `https://api-eu.sigencloud.com/` |
 | `cn` | `https://api-cn.sigencloud.com/` |
 | `apac` | `https://api-apac.sigencloud.com/` |
