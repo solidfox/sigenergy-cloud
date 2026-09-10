@@ -55,6 +55,25 @@ path `device/energy-profile/instant/manunal`. The app labels the modes as:
 Use `set_instant_manual_control()` for a 30-120 minute temporary override, and
 `disable_instant_manual_control()` to hand control back to the active strategy.
 
+## Grid and power limits
+
+The app's Grid Settings page maps to these calls. Owner values may only be
+lowered below the installer ceiling; the cloud reports both so callers can show
+the effective limit and the headroom.
+
+| App setting | Read | Write | Installer ceiling key |
+| --- | --- | --- | --- |
+| Grid Export Power Limit | `grid_export_limit()` | `set_grid_export_limit(kw)` | `maxLimitationInstaller` |
+| Grid Import Power Limit | `grid_import_limit()` | `set_grid_import_limit(kw)` | `maxLimitationInstaller` |
+| Max Grid Connection Current | `grid_connection_limit()` | `set_grid_connection_limit(kw)` | `installerSetLimitation` |
+| Battery Power Limit | `battery_power_limit()` | `set_battery_power_limit(...)` | – |
+| PV power limit | `solar_power_limit()` | `set_solar_power_limit(kw)` | – |
+| Backup Reserve | `backup_reserve()` | `set_backup_reserve(percent)` | – |
+
+`UNLIMITED_POWER_KW` (`4294967.295`) is Sigenergy's "no limit" sentinel; use
+`is_unlimited_power(value)` when displaying values. `gateway_info()` returns the
+Sigen Gateway's grid-side per-phase voltage/current readings.
+
 ## Regions
 
 | Region | Base URL |

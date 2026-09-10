@@ -5,7 +5,7 @@ import pytest
 from aioresponses import aioresponses
 from yarl import URL
 
-from sigenergy_cloud import InstantManualMode, SigenergyCloudClient
+from sigenergy_cloud import InstantManualMode, SigenergyCloudClient, is_unlimited_power
 
 
 @pytest.mark.asyncio
@@ -271,5 +271,149 @@ async def test_electricity_tax_and_fee_endpoints() -> None:
 
             cost = await client.electricity_price_cost()
             assert cost["buyPriceCoefficient"] == 1.25
+    finally:
+        await session.close()
+
+
+def _mock_login(mocked: aioresponses) -> None:
+    mocked.post(
+        "https://api-eu.sigencloud.com/auth/oauth/token",
+        payload={"access_token": "access", "refresh_token": "refresh", "expires_in": 3600},
+    )
+    mocked.get(
+        "https://api-eu.sigencloud.com/device/owner/station/home",
+        payload={
+            "code": 0,
+            "data": {"stationId": "12025061000219", "acSnList": [], "dcSnList": []},
+        },
+    )
+
+
+def _json_body(mocked: aioresponses, method: str, url: str) -> dict:
+    (request,) = mocked.requests[(method, URL(url))]
+    return request.kwargs["json"]
+
+
+@pytest.mark.asyncio
+async def test_grid_connection_limit_endpoints() -> None:
+    """Max Grid Connection Current maps to energy-profile/parallel/off/grid (HAR 2026-09-10)."""
+    session = aiohttp.ClientSession()
+    client = SigenergyCloudClient("user", "password", session=session)
+    try:
+        with aioresponses() as mocked:
+            _mock_login(mocked)
+            mocked.get(
+                "https://api-eu.sigencloud.com/device/energy-profile/parallel/off/grid/12025061000219",
+                payload={
+                    "code": 0,
+                    "msg": "success",
+                    "data": {
+                        "enable": True,
+                        "currentLimitation": "13.7",
+                        "ownerSetLimitation": "13.7",
+                        "installerSetLimitation": "13.8",
+                    },
+                },
+            )
+            mocked.put(
+                "https://api-eu.sigencloud.com/device/energy-profile/parallel/off/grid",
+                payload={"code": 0, "msg": "success", "data": True},
+            )
+
+            await client.connect()
+            limit = await client.grid_connection_limit()
+            assert limit["installerSetLimitation"] == "13.8"
+
+            saved = await client.set_grid_connection_limit(13.7)
+            assert saved["data"] is True
+            body = _json_body(
+                mocked, "PUT", "https://api-eu.sigencloud.com/device/energy-profile/parallel/off/grid"
+            )
+            assert body == {
+                "stationId": 12025061000219,
+                "enable": True,
+                "ownerSetLimitation": "13.7",
+                "installerSetLimitation": None,
+            }
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_power_limit_and_backup_reserve_endpoints() -> None:
+    session = aiohttp.ClientSession()
+    client = SigenergyCloudClient("user", "password", session=session)
+    base = "https://api-eu.sigencloud.com/"
+    try:
+        with aioresponses() as mocked:
+            _mock_login(mocked)
+            mocked.get(
+                base + "device/energy-profile/battery/limit/12025061000219",
+                payload={
+                    "code": 0,
+                    "data": {
+                        "batteryMaxChargingPower": "4294967.295",
+                        "batteryMaxDischargingPower": "5.000",
+                    },
+                },
+            )
+            mocked.put(
+                base + "device/energy-profile/battery/limit",
+                payload={"code": 0, "data": True},
+            )
+            mocked.get(
+                base + "device/energy-profile/solar/limit/12025061000219",
+                payload={"code": 0, "data": {"powerLimit": "4294967.295"}},
+            )
+            mocked.put(base + "device/energy-profile/solar/limit", payload={"code": 0, "data": True})
+            mocked.get(
+                base + "device/setting/backup/reserve/12025061000219",
+                payload={
+                    "code": 0,
+                    "data": {"stationId": 12025061000219, "backupReserve": 3, "operationMode": 1},
+                },
+            )
+            mocked.put(base + "device/setting/backup/reserve", payload={"code": 0, "data": True})
+            mocked.get(
+                base + "device/gateway/12025061000219",
+                payload={"code": 0, "data": {"snCode": "120B12C30057", "gridSideInfoList": []}},
+            )
+            mocked.get(
+                base + "device/station/grid-connection-point/support-devices?stationId=12025061000219",
+                payload={"code": 0, "data": [{"snCode": "120B12C30057", "deviceType": 8}]},
+            )
+
+            await client.connect()
+
+            battery = await client.battery_power_limit()
+            assert is_unlimited_power(battery["batteryMaxChargingPower"])
+            assert not is_unlimited_power(battery["batteryMaxDischargingPower"])
+
+            await client.set_battery_power_limit(max_charge_kw=None, max_discharge_kw=5)
+            assert _json_body(mocked, "PUT", base + "device/energy-profile/battery/limit") == {
+                "stationId": 12025061000219,
+                "batteryMaxChargingPower": "4294967.295",
+                "batteryMaxDischargingPower": "5.000",
+            }
+
+            assert (await client.solar_power_limit())["powerLimit"] == "4294967.295"
+            await client.set_solar_power_limit(6.5)
+            assert _json_body(mocked, "PUT", base + "device/energy-profile/solar/limit") == {
+                "powerLimit": "6.500",
+                "stationId": 12025061000219,
+            }
+
+            assert (await client.backup_reserve())["backupReserve"] == 3
+            await client.set_backup_reserve(10)
+            assert _json_body(mocked, "PUT", base + "device/setting/backup/reserve") == {
+                "backupReserve": 10,
+                "stationId": 12025061000219,
+            }
+            with pytest.raises(ValueError):
+                await client.set_backup_reserve(101)
+
+            assert (await client.gateway_info())["snCode"] == "120B12C30057"
+            devices = await client.grid_connection_point_devices()
+            assert devices[0]["deviceType"] == 8
     finally:
         await session.close()

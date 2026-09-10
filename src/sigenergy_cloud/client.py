@@ -19,11 +19,30 @@ from .models import (
 from .regions import base_url_for_region
 from .transport import CloudTransport
 
-_INSTANT_MANUAL_UNLIMITED_POWER_KW = 4_294_967.295
+#: Sentinel Sigenergy returns (and accepts) for "no limit" on kW settings.
+UNLIMITED_POWER_KW = 4_294_967.295
+_INSTANT_MANUAL_UNLIMITED_POWER_KW = UNLIMITED_POWER_KW
 _INSTANT_MANUAL_POWER_MODES = {
     InstantManualMode.CHARGING,
     InstantManualMode.DISCHARGING,
 }
+
+
+def is_unlimited_power(value: Any) -> bool:
+    """Return True when a kW value is Sigenergy's unlimited sentinel."""
+    try:
+        return float(value) >= UNLIMITED_POWER_KW - 0.001
+    except (TypeError, ValueError):
+        return False
+
+
+def _power_limit_str(limit_kw: float | None) -> str:
+    """Format a kW limit the way the app does, using the sentinel for unlimited."""
+    if limit_kw is None:
+        return f"{UNLIMITED_POWER_KW:.3f}"
+    if limit_kw < 0:
+        raise ValueError("power limit must be >= 0 kW")
+    return f"{limit_kw:.3f}"
 
 
 class SigenergyCloudClient:
@@ -206,7 +225,12 @@ class SigenergyCloudClient:
         )
 
     async def grid_export_limit(self) -> dict[str, Any]:
-        """Return owner grid-export limit settings."""
+        """Return grid-export limit settings.
+
+        Keys: ``enable``, ``maxLimitation`` (effective kW), ``maxLimitationOwner``
+        (owner value, kW), ``maxLimitationInstaller`` (installer ceiling, kW;
+        owners can only lower below it) and ``isUltra``.
+        """
         return await self._station_data(
             "GET", "device/energy-profile/grid/limitation/export/{station_id}"
         )
@@ -218,7 +242,7 @@ class SigenergyCloudClient:
         return await self._set_grid_limit("export", limit_kw, enabled)
 
     async def grid_import_limit(self) -> dict[str, Any]:
-        """Return owner grid-import limit settings."""
+        """Return grid-import limit settings (same keys as ``grid_export_limit``)."""
         return await self._station_data(
             "GET", "device/energy-profile/grid/limitation/import/{station_id}"
         )
@@ -228,6 +252,133 @@ class SigenergyCloudClient:
     ) -> dict[str, Any]:
         """Set owner grid-import limit settings."""
         return await self._set_grid_limit("import", limit_kw, enabled)
+
+    async def grid_connection_limit(self) -> dict[str, Any]:
+        """Return the grid-connection-point limit ("Max Grid Connection Current").
+
+        The app's Grid Settings › Max Grid Connection Current page reads
+        ``device/energy-profile/parallel/off/grid``. Keys: ``enable``,
+        ``currentLimitation`` (effective value), ``ownerSetLimitation`` (empty
+        string when the owner has not lowered the limit) and
+        ``installerSetLimitation`` (installer ceiling; owners can only lower).
+        Observed values (13.8 / 13.7) match the kW grid import/export limits on
+        the same station, so this client treats the unit as kW.
+        """
+        return await self._station_data(
+            "GET", "device/energy-profile/parallel/off/grid/{station_id}"
+        )
+
+    async def set_grid_connection_limit(
+        self, limit_kw: float, *, enabled: bool = True
+    ) -> dict[str, Any]:
+        """Set the owner grid-connection-point limit.
+
+        Setting the owner value equal to the installer ceiling makes the cloud
+        clear ``ownerSetLimitation`` to ``""`` and fall back to the installer
+        value; the app sends one decimal, which this method mirrors.
+        """
+        return await self._envelope(
+            "PUT",
+            "device/energy-profile/parallel/off/grid",
+            json={
+                "stationId": self._station_id_int(),
+                "enable": enabled,
+                "ownerSetLimitation": f"{limit_kw:.1f}",
+                "installerSetLimitation": None,
+            },
+        )
+
+    async def battery_power_limit(self) -> dict[str, Any]:
+        """Return battery power limits ("Battery Power Limit" in the app).
+
+        Keys: ``batteryMaxChargingPower`` and ``batteryMaxDischargingPower`` in
+        kW; ``UNLIMITED_POWER_KW`` means no limit (see ``is_unlimited_power``).
+        """
+        return await self._station_data(
+            "GET", "device/energy-profile/battery/limit/{station_id}"
+        )
+
+    async def set_battery_power_limit(
+        self,
+        *,
+        max_charge_kw: float | None,
+        max_discharge_kw: float | None,
+    ) -> dict[str, Any]:
+        """Set battery max charge/discharge power in kW (``None`` = unlimited).
+
+        Request shape comes from the app bundle; the write has not yet been
+        observed in captured traffic.
+        """
+        return await self._envelope(
+            "PUT",
+            "device/energy-profile/battery/limit",
+            json={
+                "stationId": self._station_id_int(),
+                "batteryMaxChargingPower": _power_limit_str(max_charge_kw),
+                "batteryMaxDischargingPower": _power_limit_str(max_discharge_kw),
+            },
+        )
+
+    async def solar_power_limit(self) -> dict[str, Any]:
+        """Return the PV power limit (``powerLimit`` in kW, unlimited sentinel)."""
+        return await self._station_data(
+            "GET", "device/energy-profile/solar/limit/{station_id}"
+        )
+
+    async def set_solar_power_limit(self, limit_kw: float | None) -> dict[str, Any]:
+        """Set the PV power limit in kW (``None`` = unlimited).
+
+        Request shape comes from the app bundle; the write has not yet been
+        observed in captured traffic.
+        """
+        return await self._envelope(
+            "PUT",
+            "device/energy-profile/solar/limit",
+            json={
+                "powerLimit": _power_limit_str(limit_kw),
+                "stationId": self._station_id_int(),
+            },
+        )
+
+    async def backup_reserve(self) -> dict[str, Any]:
+        """Return backup reserve settings.
+
+        Keys: ``backupReserve`` (percent), ``operationMode`` and ``ja12Soc``.
+        """
+        return await self._station_data(
+            "GET", "device/setting/backup/reserve/{station_id}"
+        )
+
+    async def set_backup_reserve(self, percent: int) -> dict[str, Any]:
+        """Set the backup reserve percentage.
+
+        Request shape comes from the app bundle; the write has not yet been
+        observed in captured traffic.
+        """
+        if not 0 <= percent <= 100:
+            raise ValueError("backup reserve must be 0-100 percent")
+        return await self._envelope(
+            "PUT",
+            "device/setting/backup/reserve",
+            json={"backupReserve": int(percent), "stationId": self._station_id_int()},
+        )
+
+    async def gateway_info(self) -> dict[str, Any]:
+        """Return Sigen Gateway details and grid-side real-time values.
+
+        ``gridSideInfoList`` holds per-phase voltage/current, frequency, active
+        and reactive power and grid contactor status as display strings.
+        """
+        return await self._station_data("GET", "device/gateway/{station_id}")
+
+    async def grid_connection_point_devices(self) -> list[dict[str, Any]]:
+        """Return devices attached to the grid connection point (gateway)."""
+        data = await self._station_data(
+            "GET",
+            "device/station/grid-connection-point/support-devices",
+            station_query=True,
+        )
+        return data if isinstance(data, list) else []
 
     async def battery_export_limitation(self) -> dict[str, Any]:
         """Return whether the battery may export to the grid."""
