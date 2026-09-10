@@ -296,7 +296,7 @@ def _json_body(mocked: aioresponses, method: str, url: str) -> dict:
 
 @pytest.mark.asyncio
 async def test_grid_connection_limit_endpoints() -> None:
-    """Max Grid Connection Current maps to energy-profile/parallel/off/grid (HAR 2026-09-10)."""
+    """Max Grid Connection Current (A) maps to energy-profile/parallel/off/grid (HAR 2026-09-10)."""
     session = aiohttp.ClientSession()
     client = SigenergyCloudClient("user", "password", session=session)
     try:

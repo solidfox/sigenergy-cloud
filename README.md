@@ -65,7 +65,7 @@ the effective limit and the headroom.
 | --- | --- | --- | --- |
 | Grid Export Power Limit | `grid_export_limit()` | `set_grid_export_limit(kw)` | `maxLimitationInstaller` |
 | Grid Import Power Limit | `grid_import_limit()` | `set_grid_import_limit(kw)` | `maxLimitationInstaller` |
-| Max Grid Connection Current | `grid_connection_limit()` | `set_grid_connection_limit(kw)` | `installerSetLimitation` |
+| Max Grid Connection Current (A) | `grid_connection_limit()` | `set_grid_connection_limit(a)` | `installerSetLimitation` |
 | Battery Power Limit | `battery_power_limit()` | `set_battery_power_limit(...)` | – |
 | PV power limit | `solar_power_limit()` | `set_solar_power_limit(kw)` | – |
 | Backup Reserve | `backup_reserve()` | `set_backup_reserve(percent)` | – |

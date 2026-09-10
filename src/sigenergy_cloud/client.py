@@ -254,24 +254,25 @@ class SigenergyCloudClient:
         return await self._set_grid_limit("import", limit_kw, enabled)
 
     async def grid_connection_limit(self) -> dict[str, Any]:
-        """Return the grid-connection-point limit ("Max Grid Connection Current").
+        """Return the max grid connection current limit (amperes).
 
         The app's Grid Settings › Max Grid Connection Current page reads
         ``device/energy-profile/parallel/off/grid``. Keys: ``enable``,
-        ``currentLimitation`` (effective value), ``ownerSetLimitation`` (empty
+        ``currentLimitation`` (effective A), ``ownerSetLimitation`` (empty
         string when the owner has not lowered the limit) and
-        ``installerSetLimitation`` (installer ceiling; owners can only lower).
-        Observed values (13.8 / 13.7) match the kW grid import/export limits on
-        the same station, so this client treats the unit as kW.
+        ``installerSetLimitation`` (installer ceiling in A; owners can only
+        lower). Values are amperes (phase current), not kW — do not confuse
+        with nearby grid import/export power limits that may share similar
+        numeric values.
         """
         return await self._station_data(
             "GET", "device/energy-profile/parallel/off/grid/{station_id}"
         )
 
     async def set_grid_connection_limit(
-        self, limit_kw: float, *, enabled: bool = True
+        self, limit_a: float, *, enabled: bool = True
     ) -> dict[str, Any]:
-        """Set the owner grid-connection-point limit.
+        """Set the owner max grid connection current limit in amperes.
 
         Setting the owner value equal to the installer ceiling makes the cloud
         clear ``ownerSetLimitation`` to ``""`` and fall back to the installer
@@ -283,7 +284,7 @@ class SigenergyCloudClient:
             json={
                 "stationId": self._station_id_int(),
                 "enable": enabled,
-                "ownerSetLimitation": f"{limit_kw:.1f}",
+                "ownerSetLimitation": f"{limit_a:.1f}",
                 "installerSetLimitation": None,
             },
         )
