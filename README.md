@@ -78,6 +78,7 @@ Sigen Gateway's grid-side per-phase voltage/current readings.
 
 | Region | Base URL |
 | --- | --- |
+| `aus` | `https://api-aus.sigencloud.com/` |
 | `eu` | `https://api-eu.sigencloud.com/` |
 | `cn` | `https://api-cn.sigencloud.com/` |
 | `apac` | `https://api-apac.sigencloud.com/` |
