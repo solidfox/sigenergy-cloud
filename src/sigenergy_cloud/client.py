@@ -19,11 +19,30 @@ from .models import (
 from .regions import base_url_for_region
 from .transport import CloudTransport
 
-_INSTANT_MANUAL_UNLIMITED_POWER_KW = 4_294_967.295
+#: Sentinel Sigenergy returns (and accepts) for "no limit" on kW settings.
+UNLIMITED_POWER_KW = 4_294_967.295
+_INSTANT_MANUAL_UNLIMITED_POWER_KW = UNLIMITED_POWER_KW
 _INSTANT_MANUAL_POWER_MODES = {
     InstantManualMode.CHARGING,
     InstantManualMode.DISCHARGING,
 }
+
+
+def is_unlimited_power(value: Any) -> bool:
+    """Return True when a kW value is Sigenergy's unlimited sentinel."""
+    try:
+        return float(value) >= UNLIMITED_POWER_KW - 0.001
+    except (TypeError, ValueError):
+        return False
+
+
+def _power_limit_str(limit_kw: float | None) -> str:
+    """Format a kW limit the way the app does, using the sentinel for unlimited."""
+    if limit_kw is None:
+        return f"{UNLIMITED_POWER_KW:.3f}"
+    if limit_kw < 0:
+        raise ValueError("power limit must be >= 0 kW")
+    return f"{limit_kw:.3f}"
 
 
 class SigenergyCloudClient:
@@ -110,6 +129,48 @@ class SigenergyCloudClient:
             "prediction/predictData/get/predictData/{station_id}",
         )
 
+    async def electricity_tax_and_fee(self) -> dict[str, Any]:
+        """Return buy/sell tax-and-fee settings used with dynamic Nord Pool tariffs.
+
+        Values such as ``fixedValue`` and TOU ``value`` fields are in the
+        station's minor currency unit (öre for SEK; see country-currency
+        ``conversionRatio``).
+        """
+        return await self._data(
+            "GET",
+            f"electricity-price/api/tax-and-fee/{self._station_id()}",
+        )
+
+    async def set_electricity_tax_and_fee(
+        self,
+        direction: int,
+        tax_and_fee: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Replace buy (direction=1) or sell (direction=2) tax-and-fee settings.
+
+        This is the supported write path for Nord Pool AI price modeling. Fee
+        amounts are in the minor currency unit (öre for SEK).
+        """
+        if direction not in (1, 2):
+            raise ValueError("direction must be 1 (buy) or 2 (sell)")
+        return await self._envelope(
+            "POST",
+            "electricity-price/api/tax-and-fee",
+            json={
+                "stationId": self._station_id_int(),
+                "directionType": direction,
+                "taxAndFee": tax_and_fee,
+            },
+        )
+
+    async def electricity_price_cost(self) -> dict[str, Any]:
+        """Return derived price coefficients and tax/fee summary for the station."""
+        return await self._data(
+            "GET",
+            "prediction/aipv/elecPrice/get/priceCost",
+            params={"stationId": self._station_id()},
+        )
+
     async def available_operational_modes(self) -> dict[str, Any]:
         """Return available energy-profile modes."""
         data = await self._station_data("GET", "device/energy-profile/mode/all/{station_id}")
@@ -164,7 +225,12 @@ class SigenergyCloudClient:
         )
 
     async def grid_export_limit(self) -> dict[str, Any]:
-        """Return owner grid-export limit settings."""
+        """Return grid-export limit settings.
+
+        Keys: ``enable``, ``maxLimitation`` (effective kW), ``maxLimitationOwner``
+        (owner value, kW), ``maxLimitationInstaller`` (installer ceiling, kW;
+        owners can only lower below it) and ``isUltra``.
+        """
         return await self._station_data(
             "GET", "device/energy-profile/grid/limitation/export/{station_id}"
         )
@@ -176,7 +242,7 @@ class SigenergyCloudClient:
         return await self._set_grid_limit("export", limit_kw, enabled)
 
     async def grid_import_limit(self) -> dict[str, Any]:
-        """Return owner grid-import limit settings."""
+        """Return grid-import limit settings (same keys as ``grid_export_limit``)."""
         return await self._station_data(
             "GET", "device/energy-profile/grid/limitation/import/{station_id}"
         )
@@ -186,6 +252,134 @@ class SigenergyCloudClient:
     ) -> dict[str, Any]:
         """Set owner grid-import limit settings."""
         return await self._set_grid_limit("import", limit_kw, enabled)
+
+    async def grid_connection_limit(self) -> dict[str, Any]:
+        """Return the max grid connection current limit (amperes).
+
+        The app's Grid Settings › Max Grid Connection Current page reads
+        ``device/energy-profile/parallel/off/grid``. Keys: ``enable``,
+        ``currentLimitation`` (effective A), ``ownerSetLimitation`` (empty
+        string when the owner has not lowered the limit) and
+        ``installerSetLimitation`` (installer ceiling in A; owners can only
+        lower). Values are amperes (phase current), not kW — do not confuse
+        with nearby grid import/export power limits that may share similar
+        numeric values.
+        """
+        return await self._station_data(
+            "GET", "device/energy-profile/parallel/off/grid/{station_id}"
+        )
+
+    async def set_grid_connection_limit(
+        self, limit_a: float, *, enabled: bool = True
+    ) -> dict[str, Any]:
+        """Set the owner max grid connection current limit in amperes.
+
+        Setting the owner value equal to the installer ceiling makes the cloud
+        clear ``ownerSetLimitation`` to ``""`` and fall back to the installer
+        value; the app sends one decimal, which this method mirrors.
+        """
+        return await self._envelope(
+            "PUT",
+            "device/energy-profile/parallel/off/grid",
+            json={
+                "stationId": self._station_id_int(),
+                "enable": enabled,
+                "ownerSetLimitation": f"{limit_a:.1f}",
+                "installerSetLimitation": None,
+            },
+        )
+
+    async def battery_power_limit(self) -> dict[str, Any]:
+        """Return battery power limits ("Battery Power Limit" in the app).
+
+        Keys: ``batteryMaxChargingPower`` and ``batteryMaxDischargingPower`` in
+        kW; ``UNLIMITED_POWER_KW`` means no limit (see ``is_unlimited_power``).
+        """
+        return await self._station_data(
+            "GET", "device/energy-profile/battery/limit/{station_id}"
+        )
+
+    async def set_battery_power_limit(
+        self,
+        *,
+        max_charge_kw: float | None,
+        max_discharge_kw: float | None,
+    ) -> dict[str, Any]:
+        """Set battery max charge/discharge power in kW (``None`` = unlimited).
+
+        Request shape comes from the app bundle; the write has not yet been
+        observed in captured traffic.
+        """
+        return await self._envelope(
+            "PUT",
+            "device/energy-profile/battery/limit",
+            json={
+                "stationId": self._station_id_int(),
+                "batteryMaxChargingPower": _power_limit_str(max_charge_kw),
+                "batteryMaxDischargingPower": _power_limit_str(max_discharge_kw),
+            },
+        )
+
+    async def solar_power_limit(self) -> dict[str, Any]:
+        """Return the PV power limit (``powerLimit`` in kW, unlimited sentinel)."""
+        return await self._station_data(
+            "GET", "device/energy-profile/solar/limit/{station_id}"
+        )
+
+    async def set_solar_power_limit(self, limit_kw: float | None) -> dict[str, Any]:
+        """Set the PV power limit in kW (``None`` = unlimited).
+
+        Request shape comes from the app bundle; the write has not yet been
+        observed in captured traffic.
+        """
+        return await self._envelope(
+            "PUT",
+            "device/energy-profile/solar/limit",
+            json={
+                "powerLimit": _power_limit_str(limit_kw),
+                "stationId": self._station_id_int(),
+            },
+        )
+
+    async def backup_reserve(self) -> dict[str, Any]:
+        """Return backup reserve settings.
+
+        Keys: ``backupReserve`` (percent), ``operationMode`` and ``ja12Soc``.
+        """
+        return await self._station_data(
+            "GET", "device/setting/backup/reserve/{station_id}"
+        )
+
+    async def set_backup_reserve(self, percent: int) -> dict[str, Any]:
+        """Set the backup reserve percentage.
+
+        Request shape comes from the app bundle; the write has not yet been
+        observed in captured traffic.
+        """
+        if not 0 <= percent <= 100:
+            raise ValueError("backup reserve must be 0-100 percent")
+        return await self._envelope(
+            "PUT",
+            "device/setting/backup/reserve",
+            json={"backupReserve": int(percent), "stationId": self._station_id_int()},
+        )
+
+    async def gateway_info(self) -> dict[str, Any]:
+        """Return Sigen Gateway details and grid-side real-time values.
+
+        ``gridSideInfoList`` holds per-phase voltage/current, frequency, active
+        and reactive power and grid contactor status as display strings.
+        """
+        return await self._station_data("GET", "device/gateway/{station_id}")
+
+    async def grid_connection_point_devices(self) -> list[dict[str, Any]]:
+        """Return devices attached to the grid connection point (gateway)."""
+        data = await self._station_data(
+            "GET",
+            "device/station/grid-connection-point/support-devices",
+            station_query=True,
+        )
+        return data if isinstance(data, list) else []
 
     async def battery_export_limitation(self) -> dict[str, Any]:
         """Return whether the battery may export to the grid."""
@@ -744,6 +938,27 @@ class SigenergyCloudClient:
             (not power_on) and status in {3, 5, 6}
         )
 
+    async def _force_aio_power_on(
+        self,
+        *,
+        sn_code: str,
+        timeout_s: float = 180.0,
+        poll_s: float = 2.0,
+    ) -> bool:
+        """Best-effort power-on. Used after AIO off so the plant is not left off."""
+        await self._envelope(
+            "POST",
+            "device/aio/on-off",
+            json={
+                "snCode": sn_code,
+                "stationId": self._station_id_int(),
+                "powerOn": True,
+            },
+        )
+        return await self.set_aio_power(
+            True, sn_code=sn_code, timeout_s=timeout_s, poll_s=poll_s
+        )
+
     async def restart_aio(
         self,
         *,
@@ -764,6 +979,10 @@ class SigenergyCloudClient:
         ``deviceStatus`` / ``communicateStatus``) → powerOn=true → poll until
         plant running. EVDC offline wait is best-effort with timeout so the
         plant is never left powered off.
+
+        After off is attempted, a shielded ``finally`` recovery always tries to
+        restore power-on (including on cancel and status-read failures). Topology
+        rate limits abort the EVDC wait early and still power on.
         """
         import asyncio
         import time
@@ -782,67 +1001,110 @@ class SigenergyCloudClient:
         except Exception:  # noqa: BLE001
             evdc_before = {"offline": None, "error": "topology_read_failed"}
 
-        t_off_cmd = time.monotonic()
-        await self.toggle_aio_power(sn_code=sn)
-
         powered_off = False
+        powered_on = False
         t_offline = None
-        deadline = asyncio.get_running_loop().time() + timeout_s
-        while asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(poll_s)
-            home = await self.get_station_home_status()
-            if home.get("status") in {3, 5, 6}:
-                powered_off = True
-                t_offline = time.monotonic()
-                break
-
         t_evdc_offline = None
+        t_on_cmd: float | None = None
+        t_online = None
+        t_off_cmd = time.monotonic()
         evdc_after_off: dict[str, Any] | None = None
         evdc_offline_seen = False
-        if powered_off and wait_evdc_offline:
-            evdc_deadline = asyncio.get_running_loop().time() + max(
-                float(evdc_offline_wait_s), 0.0
-            )
-            while asyncio.get_running_loop().time() < evdc_deadline:
+        evdc_wait_aborted: str | None = None
+        power_on_forced = False
+        after_home: dict[str, Any] | None = None
+        after_power: bool | None = None
+        evdc_final: dict[str, Any] | None = None
+        # Set before toggle await so cancel mid-off still runs recovery.
+        off_attempted = False
+
+        async def _ensure_powered_on(*, reason: str) -> None:
+            """Best-effort restore. Read failures still force power-on."""
+            nonlocal powered_on, power_on_forced, t_on_cmd, t_online
+            nonlocal after_home, after_power
+            status_home: dict[str, Any] | None = None
+            power_flag: bool | None = None
+            clearly_on = False
+            try:
+                status_home = await self.get_station_home_status()
+                power_flag = await self.get_aio_power_on(sn_code=sn)
+                clearly_on = (
+                    status_home.get("status") in {0, 1, 2} and power_flag is True
+                )
+            except Exception:  # noqa: BLE001
+                clearly_on = False
+            if clearly_on:
+                # Reuse the same reads that proved online — do not re-query
+                # (a later transient failure would leave after_* inconsistent).
+                powered_on = True
+                after_home = status_home
+                after_power = power_flag
+                return
+            power_on_forced = True
+            if t_on_cmd is None:
+                t_on_cmd = time.monotonic()
+            try:
+                powered_on = await self._force_aio_power_on(
+                    sn_code=sn, timeout_s=timeout_s, poll_s=poll_s
+                )
+            except Exception:  # noqa: BLE001
+                powered_on = False
+            if powered_on and t_online is None:
+                t_online = time.monotonic()
+            try:
+                after_home = await self.get_station_home_status()
+                after_power = await self.get_aio_power_on(sn_code=sn)
+                if after_home.get("status") in {0, 1, 2} and after_power is True:
+                    powered_on = True
+            except Exception as exc:  # noqa: BLE001
+                if after_home is None:
+                    after_home = {
+                        "status": None,
+                        "error": f"ensure_on_status ({reason}): {exc}",
+                    }
+
+        try:
+            off_attempted = True
+            t_off_cmd = time.monotonic()
+            await self.toggle_aio_power(sn_code=sn)
+
+            deadline = asyncio.get_running_loop().time() + timeout_s
+            while asyncio.get_running_loop().time() < deadline:
                 await asyncio.sleep(poll_s)
-                try:
-                    evdc_after_off = await self.topology_evdc_status()
-                except Exception as exc:  # noqa: BLE001
-                    evdc_after_off = {"offline": None, "error": str(exc)}
-                if evdc_after_off.get("offline") is True:
-                    evdc_offline_seen = True
-                    t_evdc_offline = time.monotonic()
+                home = await self.get_station_home_status()
+                if home.get("status") in {3, 5, 6}:
+                    powered_off = True
+                    t_offline = time.monotonic()
                     break
 
-        if off_dwell_s > 0 and powered_off:
-            await asyncio.sleep(off_dwell_s)
+            if powered_off and wait_evdc_offline:
+                evdc_deadline = asyncio.get_running_loop().time() + max(
+                    float(evdc_offline_wait_s), 0.0
+                )
+                while asyncio.get_running_loop().time() < evdc_deadline:
+                    await asyncio.sleep(poll_s)
+                    try:
+                        evdc_after_off = await self.topology_evdc_status()
+                    except SigenergyCloudRateLimitError as exc:
+                        # Best-effort wait: do not hammer topology while plant is off.
+                        evdc_after_off = {
+                            "offline": None,
+                            "error": "rate_limited",
+                            "detail": str(exc),
+                        }
+                        evdc_wait_aborted = "topology_rate_limited"
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        evdc_after_off = {"offline": None, "error": str(exc)}
+                    if evdc_after_off.get("offline") is True:
+                        evdc_offline_seen = True
+                        t_evdc_offline = time.monotonic()
+                        break
 
-        t_on_cmd = time.monotonic()
-        await self._envelope(
-            "POST",
-            "device/aio/on-off",
-            json={
-                "snCode": sn,
-                "stationId": self._station_id_int(),
-                "powerOn": True,
-            },
-        )
+            if off_dwell_s > 0 and powered_off:
+                await asyncio.sleep(off_dwell_s)
 
-        powered_on = False
-        t_online = None
-        deadline = asyncio.get_running_loop().time() + timeout_s
-        while asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(poll_s)
-            home = await self.get_station_home_status()
-            power_on = await self.get_aio_power_on(sn_code=sn)
-            if home.get("status") in {0, 1, 2} and power_on is True:
-                powered_on = True
-                t_online = time.monotonic()
-                break
-
-        # Safety: if still power-off, try once more with powerOn true.
-        after_home = await self.get_station_home_status()
-        if after_home.get("status") in {3, 5, 6}:
+            t_on_cmd = time.monotonic()
             await self._envelope(
                 "POST",
                 "device/aio/on-off",
@@ -852,18 +1114,53 @@ class SigenergyCloudClient:
                     "powerOn": True,
                 },
             )
-            powered_on = await self.set_aio_power(
-                True, sn_code=sn, timeout_s=timeout_s, poll_s=poll_s
-            )
-            after_home = await self.get_station_home_status()
-            if powered_on:
-                t_online = time.monotonic()
 
-        after_power = await self.get_aio_power_on(sn_code=sn)
-        try:
-            evdc_final = await self.topology_evdc_status()
-        except Exception:  # noqa: BLE001
-            evdc_final = {"offline": None, "error": "topology_read_failed"}
+            deadline = asyncio.get_running_loop().time() + timeout_s
+            while asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(poll_s)
+                home = await self.get_station_home_status()
+                power_on = await self.get_aio_power_on(sn_code=sn)
+                if home.get("status") in {0, 1, 2} and power_on is True:
+                    powered_on = True
+                    t_online = time.monotonic()
+                    break
+
+            # Safety: if still power-off, try once more with powerOn true.
+            after_home = await self.get_station_home_status()
+            if after_home.get("status") in {3, 5, 6}:
+                await _ensure_powered_on(reason="post_cycle_still_off")
+        finally:
+            # Invariant: once off was attempted, never leave the plant powered off.
+            # Shield recovery so outer cancel/timeout cannot abort the force-on.
+            if off_attempted:
+                recovery = asyncio.create_task(
+                    _ensure_powered_on(reason="finally"),
+                    name="sigenergy-restart-aio-ensure-on",
+                )
+                try:
+                    await asyncio.shield(recovery)
+                except asyncio.CancelledError:
+                    # Finish force-on even if this coroutine is cancelled.
+                    await recovery
+                    raise
+                try:
+                    evdc_final = await self.topology_evdc_status()
+                except Exception:  # noqa: BLE001
+                    evdc_final = {"offline": None, "error": "topology_read_failed"}
+
+        if after_home is None:
+            after_home = {}
+        if after_power is None:
+            try:
+                after_power = await self.get_aio_power_on(sn_code=sn)
+            except Exception:  # noqa: BLE001
+                after_power = None
+        if evdc_final is None:
+            try:
+                evdc_final = await self.topology_evdc_status()
+            except Exception:  # noqa: BLE001
+                evdc_final = {"offline": None, "error": "topology_read_failed"}
+
         return {
             "sn_code": sn,
             "power_on_before": before_power,
@@ -873,6 +1170,8 @@ class SigenergyCloudClient:
             "evdc_topology_after_off": evdc_after_off,
             "evdc_topology_after": evdc_final,
             "evdc_offline_seen": evdc_offline_seen,
+            "evdc_wait_aborted": evdc_wait_aborted,
+            "power_on_forced": power_on_forced,
             "powered_off": powered_off,
             "powered_on": powered_on,
             "power_on_after": after_power,
@@ -889,7 +1188,9 @@ class SigenergyCloudClient:
                 else round(t_evdc_offline - t_offline, 2)
             ),
             "t_online_after_on_s": (
-                None if t_online is None else round(t_online - t_on_cmd, 2)
+                None
+                if t_online is None or t_on_cmd is None
+                else round(t_online - t_on_cmd, 2)
             ),
             "full_cycle_s": (
                 None if t_online is None else round(t_online - t_off_cmd, 2)
