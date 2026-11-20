@@ -52,7 +52,7 @@ path `device/energy-profile/instant/manunal`. The app labels the modes as:
 | `2` | Hold Battery |
 | `3` | Self-Consumption |
 
-Use `set_instant_manual_control()` for a 30-120 minute temporary override, and
+Use `set_instant_manual_control()` for a temporary override, and
 `disable_instant_manual_control()` to hand control back to the active strategy.
 
 ## Grid and power limits
