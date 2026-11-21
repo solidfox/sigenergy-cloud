@@ -38,6 +38,43 @@ def test_battery_level_settings_round_trip() -> None:
     }
 
 
+
+def test_battery_levels_empty_peak_shaving_soc_parses_none() -> None:
+    # Live payload (HAR 2026-09-10 grid-settings): Sigen sends "" for peakShavingSOC.
+    settings = BatteryLevelSettings.from_api(
+        {
+            "chargeSOC": "100.0",
+            "dischargeSOC": "0.0",
+            "backupSOC": "3.0",
+            "peakShavingSOC": "",
+            "ja12SOC": "0.0",
+        }
+    )
+
+    assert settings == BatteryLevelSettings(
+        charge_soc=100,
+        discharge_soc=0,
+        peak_shaving_soc=None,
+        backup_soc=3,
+    )
+
+
+def test_battery_levels_to_api_sends_empty_string_for_none() -> None:
+    settings = BatteryLevelSettings(
+        charge_soc=95,
+        discharge_soc=0,
+        peak_shaving_soc=None,
+        backup_soc=3,
+    )
+
+    assert settings.to_api(12345678901234) == {
+        "stationId": 12345678901234,
+        "chargeSOC": "95",
+        "dischargeSOC": "0",
+        "peakShavingSOC": "",
+        "backupSOC": "3",
+    }
+
 def test_instant_manual_control_from_api() -> None:
     control = InstantManualControl.from_api(
         {"enable": True, "mode": "1", "endTime": "1776471497"}

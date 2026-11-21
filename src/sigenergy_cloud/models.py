@@ -7,8 +7,15 @@ from enum import Enum
 from typing import Any
 
 
-def _int_percent(value: Any) -> int:
+def _int_percent(value: Any) -> int | None:
+    # The cloud sends "" for thresholds it has no value for (peakShavingSOC).
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
     return int(float(value))
+
+
+def _percent_to_api(value: int | None) -> str:
+    return "" if value is None else str(value)
 
 
 class InstantManualMode(str, Enum):
@@ -45,27 +52,27 @@ class InstantManualControl:
 class BatteryLevelSettings:
     """Battery SOC thresholds, all expressed as percentages."""
 
-    charge_soc: int
-    discharge_soc: int
-    peak_shaving_soc: int
-    backup_soc: int
+    charge_soc: int | None
+    discharge_soc: int | None
+    peak_shaving_soc: int | None
+    backup_soc: int | None
 
     @classmethod
     def from_api(cls, data: dict[str, Any]) -> "BatteryLevelSettings":
         return cls(
-            charge_soc=_int_percent(data["chargeSOC"]),
-            discharge_soc=_int_percent(data["dischargeSOC"]),
-            peak_shaving_soc=_int_percent(data["peakShavingSOC"]),
-            backup_soc=_int_percent(data["backupSOC"]),
+            charge_soc=_int_percent(data.get("chargeSOC")),
+            discharge_soc=_int_percent(data.get("dischargeSOC")),
+            peak_shaving_soc=_int_percent(data.get("peakShavingSOC")),
+            backup_soc=_int_percent(data.get("backupSOC")),
         )
 
     def to_api(self, station_id: int) -> dict[str, Any]:
         return {
             "stationId": station_id,
-            "chargeSOC": str(self.charge_soc),
-            "dischargeSOC": str(self.discharge_soc),
-            "peakShavingSOC": str(self.peak_shaving_soc),
-            "backupSOC": str(self.backup_soc),
+            "chargeSOC": _percent_to_api(self.charge_soc),
+            "dischargeSOC": _percent_to_api(self.discharge_soc),
+            "peakShavingSOC": _percent_to_api(self.peak_shaving_soc),
+            "backupSOC": _percent_to_api(self.backup_soc),
         }
 
 
