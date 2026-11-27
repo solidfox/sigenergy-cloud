@@ -449,8 +449,9 @@ class SigenergyCloudClient:
         unlimited-power sentinel.
         """
         mode = InstantManualMode(mode)
-        if duration_minutes < 30 or duration_minutes > 120:
-            raise ValueError("Instant Manual Control duration must be 30-120 minutes")
+        # App and API empirically permits anything from 1—1440 minutes:
+        if duration_minutes < 1 or duration_minutes > 1440:
+            raise ValueError("Instant Manual Control duration must be 1—1440 minutes")
         if power_limitation_kw is None:
             power_limitation = (
                 f"{_INSTANT_MANUAL_UNLIMITED_POWER_KW:.3f}"
