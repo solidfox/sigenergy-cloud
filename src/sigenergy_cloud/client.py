@@ -447,11 +447,13 @@ class SigenergyCloudClient:
         and Self-Consumption. For Charging and Discharging, a missing power
         limit follows the app's captured behavior and sends Sigenergy's
         unlimited-power sentinel.
+
+        ``duration_minutes`` must be 1-1440 (up to 24 hours), the range the
+        app and API have been observed to accept.
         """
         mode = InstantManualMode(mode)
-        # App and API empirically permits anything from 1—1440 minutes:
         if duration_minutes < 1 or duration_minutes > 1440:
-            raise ValueError("Instant Manual Control duration must be 1—1440 minutes")
+            raise ValueError("Instant Manual Control duration must be 1-1440 minutes")
         if power_limitation_kw is None:
             power_limitation = (
                 f"{_INSTANT_MANUAL_UNLIMITED_POWER_KW:.3f}"

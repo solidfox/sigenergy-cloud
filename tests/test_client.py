@@ -142,6 +142,18 @@ async def test_instant_manual_control_endpoints() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("duration_minutes", [0, 1441])
+async def test_set_instant_manual_control_rejects_out_of_range_duration(
+    duration_minutes: int,
+) -> None:
+    client = SigenergyCloudClient("user", "password")
+    with pytest.raises(ValueError, match="1-1440 minutes"):
+        await client.set_instant_manual_control(
+            InstantManualMode.CHARGING, duration_minutes=duration_minutes
+        )
+
+
+@pytest.mark.asyncio
 async def test_disable_instant_manual_control() -> None:
     session = aiohttp.ClientSession()
     client = SigenergyCloudClient("user", "password", session=session)
